@@ -39,6 +39,13 @@ Pulls:
      depends on bigballsdata data. Requires BIGBALLS_API_KEY; runs are
      skipped cleanly without it, same as every other optional key here.
 
+v2.8 additions:
+  9. Kickoff weather for every completed game (2024-2026)  -> Open-Meteo archive (free, no key). Output: weatherGames.
+     The model reads it, measures what wind / cold / rain / altitude do beyond the closing line, and applies only what holds up.
+ 10. Daily snapshots -> snapshots/cfb_snapshot_YYYY-MM-DD.json + snapshots/index.json: injuries, every book's lines with
+     openers, team efficiency ratings as of that day, public betting splits (optional: public_splits.json or CFB_SPLITS_URL).
+     Run daily and commit the snapshots folder. After a few weeks:  python cfb_edge_data_pull.py --snapshot-report
+
 Outputs: cfb_model_data.json in the same folder, matching the schema
 NCAA_Edge_Model_v1.html's loadModelData() expects:
 
@@ -152,6 +159,7 @@ def _print_key_report():
         print("  ! CFBD and ODDS keys are identical — one of them is wrong.")
     if BIGBALLS_API_KEY and (BIGBALLS_API_KEY in (CFBD_API_KEY, ODDS_API_KEY)):
         print("  ! BIGBALLS key equals another key — one of them is wrong.")
+PULL_VERSION  = "v2.8"
 SEASON        = int(os.environ.get("CFB_SEASON", "2026"))
 OUTPUT_PATH   = os.environ.get("CFB_OUTPUT_PATH", "cfb_model_data.json")
 
@@ -2738,8 +2746,295 @@ def pull_def_vs_position(weeks, pos_lookup):
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════
+# v2.8 STAGE 1 — historical weather for every game (Open-Meteo archive, free, no key)
+# ══════════════════════════════════════════════════════════════════════
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+WX_HOURLY = "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_gusts_10m"
+
+
+def _wx_get(params, _tries=3):
+    """One Open-Meteo archive call. Retries on 429/5xx; returns the parsed JSON or None."""
+    for i in range(_tries):
+        try:
+            r = requests.get(OPEN_METEO_ARCHIVE, params=params, timeout=40)
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(2.0 * (i + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if i == _tries - 1:
+                print(f"  ! Open-Meteo error: {e}")
+            else:
+                time.sleep(1.5)
+    return None
+
+
+def _wx_window(hourly, kick_iso, hours=4):
+    """Kickoff-hour weather: mean temp/wind/humidity, max gust, total precipitation over the first `hours` hourly rows from
+    kickoff (UTC). Returns None when the kickoff hour is not in the response."""
+    try:
+        times = hourly["time"]
+        k = datetime.fromisoformat(kick_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+        key = k.strftime("%Y-%m-%dT%H:00")
+        i0 = times.index(key)
+    except Exception:
+        return None
+    idx = [i for i in range(i0, min(i0 + hours, len(times)))]
+    def col(name):
+        v = [hourly.get(name, [None] * len(times))[i] for i in idx]
+        return [x for x in v if x is not None]
+    t, w, g, p, h = col("temperature_2m"), col("wind_speed_10m"), col("wind_gusts_10m"), col("precipitation"), col("relative_humidity_2m")
+    if not t or not w:
+        return None
+    return {"tempF": round(sum(t) / len(t), 1), "windMph": round(sum(w) / len(w), 1), "gustMph": round(max(g), 1) if g else None,
+            "precipIn": round(sum(p), 2) if p else 0.0, "humidity": round(sum(h) / len(h)) if h else None}
+
+
+def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None):
+    """Weather at kickoff for every completed regular-season game in `years` (Open-Meteo archive). Powers the model's own
+    weather backtest: it measures whether wind, cold, rain and altitude explain results beyond the closing line, and only
+    switches an adjustment on when the data says it matters. One call per venue per season. Rows already pulled in an earlier
+    run (found in the previous cfb_model_data.json) are reused, so only new games cost calls. Domes are recorded with no weather."""
+    print(f"Pulling kickoff weather for completed games in {years} (Open-Meteo archive)...")
+    have = {str(r.get("id")): r for r in (previous_rows or []) if r.get("id") is not None}
+    rows, todo = [], {}
+    n_reused = n_skip = 0
+    for y in years:
+        games = _season_games() if y == SEASON else (cfbd_get("/games", {"year": y, "seasonType": "regular"}) or [])
+        for g in games:
+            hp, ap = _g(g, "homePoints", "home_points"), _g(g, "awayPoints", "away_points")
+            gid, kick = g.get("id"), _g(g, "startDate", "start_date")
+            home, away = _abbr(_g(g, "homeTeam", "home_team")), _abbr(_g(g, "awayTeam", "away_team"))
+            if hp is None or ap is None or gid is None or not kick or not home or not away:
+                continue
+            if str(gid) in have:
+                rows.append(have[str(gid)]); n_reused += 1
+                continue
+            nm = str(g.get("venue") or "").strip().lower()
+            neutral = bool(_g(g, "neutralSite", "neutral_site"))
+            v = venues_by_name.get(nm) if nm else None
+            if v is None and not neutral:
+                v = home_venues.get(home)
+            if v is None:
+                n_skip += 1
+                continue
+            base = {"season": y, "wk": g.get("week"), "id": str(gid), "home": home, "away": away, "venue": v.get("venue"),
+                    "kick": kick, "dome": bool(v.get("dome")), "elevation": v.get("elevation"), "lat": v.get("lat"), "lon": v.get("lon")}
+            if _g(g, "startTimeTBD", "start_time_tbd"):
+                base["kickGuess"] = True
+                kick = kick[:10] + "T20:00:00Z"
+            if base["dome"]:
+                base.update({"tempF": None, "windMph": None, "gustMph": None, "precipIn": None, "humidity": None, "src": "dome"})
+                rows.append(base)
+                continue
+            todo.setdefault((y, round(v["lat"], 2), round(v["lon"], 2)), []).append((base, kick))
+    calls = filled = 0
+    for (y, lat, lon), items in todo.items():
+        days = []
+        for b, k in items:
+            d = datetime.fromisoformat(k.replace("Z", "+00:00")).astimezone(timezone.utc)
+            days.append(d.date())
+        j = _wx_get({"latitude": lat, "longitude": lon, "start_date": min(days).isoformat(), "end_date": max(days).isoformat(),
+                     "hourly": WX_HOURLY, "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "precipitation_unit": "inch",
+                     "timezone": "UTC"})
+        calls += 1
+        time.sleep(0.15)
+        for b, k in items:
+            w = _wx_window((j or {}).get("hourly") or {}, k)
+            if w:
+                b.update(w); b["src"] = "open-meteo-archive"; filled += 1
+            else:
+                b.update({"tempF": None, "windMph": None, "gustMph": None, "precipIn": None, "humidity": None, "src": "missing"})
+            rows.append(b)
+    print(f"  -> {len(rows)} games ({n_reused} reused from the last file, {filled} newly filled in {calls} calls, {n_skip} skipped: no venue coordinates)")
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════════════
+# v2.8 STAGE 2 — daily snapshots so injuries, ratings, line movement and public splits can be tested without look-ahead
+# ══════════════════════════════════════════════════════════════════════
+SNAPSHOT_DIR = os.environ.get("CFB_SNAPSHOT_DIR", "snapshots")
+SNAP_KEEP = ["plays", "ppa", "successRate", "explosiveness", "havocTotal", "stdDownsSR", "stdDownsPPA", "passDownsSR", "passDownsPPA",
+             "rushPPA", "passPPA", "rushSR", "passSR", "lineYards", "stuffRate", "pointsPerOpportunity"]
+
+
+def load_public_splits():
+    """Public betting splits. No free feed is wired in. Two optional inputs, both merged: public_splits.json next to the script
+    (path in CFB_PUBLIC_SPLITS) and a JSON URL in CFB_SPLITS_URL (your provider's export). Accepted shape, keyed 'AWAY@HOME':
+    {"spreadTicketsHome": 41, "spreadMoneyHome": 58, "totalTicketsOver": 66, "totalMoneyOver": 52, "book": "..", "source": ".."}
+    (percentages 0-100 for the HOME side of the spread and the OVER). Returns {} when nothing is configured."""
+    out = {}
+    path = os.environ.get("CFB_PUBLIC_SPLITS", "public_splits.json")
+    srcs = []
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                srcs.append(json.load(f))
+        except Exception as e:
+            print(f"  ! could not read {path}: {e}")
+    url = os.environ.get("CFB_SPLITS_URL")
+    if url:
+        try:
+            r = requests.get(url, timeout=30); r.raise_for_status(); srcs.append(r.json())
+        except Exception as e:
+            print(f"  ! could not fetch CFB_SPLITS_URL: {e}")
+    for s in srcs:
+        if isinstance(s, dict):
+            for k, v in s.items():
+                if isinstance(v, dict):
+                    out[str(k)] = v
+    print(f"  -> public splits: {len(out)} games" + ("" if out else " (none configured)"))
+    return out
+
+
+def write_snapshot(injuries, current_lines, teams_advanced, public_splits):
+    """One file per day: snapshots/cfb_snapshot_YYYY-MM-DD.json (re-running the same day overwrites that day), plus
+    snapshots/index.json. Holds what the live data looked like BEFORE the games: injuries, every book's current and opening
+    lines, team efficiency ratings as of that day, and public splits. Commit the folder with the data file."""
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        ratings = {}
+        for tm, v in (teams_advanced or {}).items():
+            ratings[tm] = {side: {k: (v.get(side) or {}).get(k) for k in SNAP_KEEP if (v.get(side) or {}).get(k) is not None} for side in ("off", "def")}
+        lines = [{"id": r.get("id"), "week": r.get("week"), "date": r.get("date"), "home": r.get("home"), "away": r.get("away"),
+                  "neutral": r.get("neutral"), "books": r.get("books"), "spread": r.get("spread"), "spreadOpen": r.get("spreadOpen"),
+                  "total": r.get("total"), "totalOpen": r.get("totalOpen")} for r in (current_lines or [])]
+        snap = {"generated": now.isoformat(), "season": SEASON, "injuries": injuries or {}, "lines": lines, "ratings": ratings,
+                "publicSplits": public_splits or {}}
+        fn = f"cfb_snapshot_{now.strftime('%Y-%m-%d')}.json"
+        with open(os.path.join(SNAPSHOT_DIR, fn), "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        idx_path = os.path.join(SNAPSHOT_DIR, "index.json")
+        try:
+            with open(idx_path, encoding="utf-8") as f:
+                idx = json.load(f)
+        except Exception:
+            idx = []
+        idx = [e for e in idx if e.get("file") != fn]
+        idx.append({"file": fn, "date": now.strftime("%Y-%m-%d"), "generated": now.isoformat(), "injuries": len(injuries or {}),
+                    "lines": len(lines), "teamsRated": len(ratings), "splits": len(public_splits or {})})
+        idx.sort(key=lambda e: e["date"])
+        with open(idx_path, "w", encoding="utf-8") as f:
+            json.dump(idx, f, indent=1)
+        print(f"  -> snapshot saved: {SNAPSHOT_DIR}/{fn} ({len(injuries or {})} injuries, {len(lines)} lines, {len(ratings)} team ratings, {len(public_splits or {})} splits)")
+        return {"file": fn, "days": len(idx)}
+    except Exception as e:
+        print(f"  ! snapshot not saved: {e}")
+        return None
+
+
+def _ols1(x, y):
+    """One-variable regression y = a + b*x. Returns (n, b, t-stat). t is None when it cannot be computed."""
+    n = len(x)
+    if n < 20:
+        return n, None, None
+    mx, my = sum(x) / n, sum(y) / n
+    sxx = sum((a - mx) ** 2 for a in x)
+    if sxx <= 1e-12:
+        return n, None, None
+    b = sum((a - mx) * (c - my) for a, c in zip(x, y)) / sxx
+    a0 = my - b * mx
+    sse = sum((c - (a0 + b * a)) ** 2 for a, c in zip(x, y))
+    se = (sse / (n - 2) / sxx) ** 0.5 if n > 2 else 0
+    return n, b, (b / se if se > 0 else None)
+
+
+_INJ_W = {"OUT": 1.0, "DOUBTFUL": 0.75, "QUESTIONABLE": 0.35}
+
+
+def snapshot_report():
+    """python cfb_edge_data_pull.py --snapshot-report
+    Reads snapshots/ and the latest cfb_model_data.json, joins each finished game to the last snapshot taken at least 20 hours
+    before kickoff, and tests whether four things explain the result beyond the closing line: team efficiency ratings,
+    early line movement, injuries (QB counts 4x) and public splits. Prints n, slope and t-stat for each. |t| >= 2 with a
+    sensible sign over a few hundred games is the bar before any of it goes into the model."""
+    try:
+        with open(OUTPUT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Cannot read {OUTPUT_PATH}: {e}")
+        return
+    try:
+        with open(os.path.join(SNAPSHOT_DIR, "index.json"), encoding="utf-8") as f:
+            idx = json.load(f)
+    except Exception:
+        print(f"No snapshots yet in {SNAPSHOT_DIR}/. Run the data pull daily and come back after a few weeks of games.")
+        return
+    snaps = []
+    for e in idx:
+        try:
+            with open(os.path.join(SNAPSHOT_DIR, e["file"]), encoding="utf-8") as f:
+                s = json.load(f)
+            snaps.append((datetime.fromisoformat(s["generated"]), s))
+        except Exception:
+            continue
+    snaps.sort(key=lambda x: x[0])
+    print(f"{len(snaps)} daily snapshots: {snaps[0][0].date() if snaps else '-'} to {snaps[-1][0].date() if snaps else '-'}")
+    games = {}
+    for g in (data.get("scheduleGames") or []) + ((data.get("teamGameLedger") or {}).get("games") or []):
+        games[(g.get("home"), g.get("away"), g.get("week"))] = g
+    hist = {}
+    for g in (data.get("historicalGames") or {}).get(str(SEASON), []) or []:
+        hist[(g.get("home"), g.get("away"), g.get("wk"))] = g
+    feats = {k: ([], [], []) for k in ("ppa_net_diff", "success_net_diff", "line_move_to_home", "injury_diff", "spread_tickets_home", "spread_money_home", "tickets_minus_money", "total_tickets_over")}
+    for (home, away, wk), h in hist.items():
+        gm = games.get((home, away, wk))
+        if not gm or h.get("homeScore") is None or h.get("spread") is None:
+            continue
+        try:
+            kick = datetime.fromisoformat(str(gm["date"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        prior = [s for t, s in snaps if (kick - t).total_seconds() >= 20 * 3600]
+        if not prior:
+            continue
+        s = prior[-1]
+        am = h["homeScore"] - h["awayScore"]
+        resid_m = am + h["spread"]                    # actual margin minus market margin (home view)
+        resid_t = (h["homeScore"] + h["awayScore"]) - h["total"] if h.get("total") is not None else None
+        r = s.get("ratings") or {}
+        def net(tm, k):
+            o, d = (r.get(tm) or {}).get("off") or {}, (r.get(tm) or {}).get("def") or {}
+            return (o.get(k) - d.get(k)) if o.get(k) is not None and d.get(k) is not None else None
+        for key, k in (("ppa_net_diff", "ppa"), ("success_net_diff", "successRate")):
+            a, b = net(home, k), net(away, k)
+            if a is not None and b is not None:
+                feats[key][0].append(a - b); feats[key][1].append(resid_m)
+        ln = next((x for x in (s.get("lines") or []) if x.get("home") == home and x.get("away") == away), None)
+        if ln and ln.get("spread") is not None and ln.get("spreadOpen") is not None:
+            feats["line_move_to_home"][0].append(ln["spreadOpen"] - ln["spread"]); feats["line_move_to_home"][1].append(resid_m)
+        inj = s.get("injuries") or {}
+        def burden(tm):
+            tot = 0.0
+            for nm, e in inj.items():
+                if e.get("team") == tm:
+                    w = _INJ_W.get(str(e.get("status", "")).upper(), 0.0)
+                    tot += w * (4.0 if str(e.get("pos", "")).upper() == "QB" else 1.0)
+            return tot
+        if inj:
+            feats["injury_diff"][0].append(burden(away) - burden(home)); feats["injury_diff"][1].append(resid_m)
+        sp = (s.get("publicSplits") or {}).get(f"{away}@{home}")
+        if sp:
+            if sp.get("spreadTicketsHome") is not None:
+                feats["spread_tickets_home"][0].append(sp["spreadTicketsHome"] - 50); feats["spread_tickets_home"][1].append(resid_m)
+            if sp.get("spreadMoneyHome") is not None:
+                feats["spread_money_home"][0].append(sp["spreadMoneyHome"] - 50); feats["spread_money_home"][1].append(resid_m)
+            if sp.get("spreadTicketsHome") is not None and sp.get("spreadMoneyHome") is not None:
+                feats["tickets_minus_money"][0].append(sp["spreadTicketsHome"] - sp["spreadMoneyHome"]); feats["tickets_minus_money"][1].append(resid_m)
+            if sp.get("totalTicketsOver") is not None and resid_t is not None:
+                feats["total_tickets_over"][0].append(sp["totalTicketsOver"] - 50); feats["total_tickets_over"][1].append(resid_t)
+    print("\nFeature (vs result minus closing line)       n    slope     t-stat")
+    for key, (x, y, _) in feats.items():
+        n, b, t = _ols1(x, y)
+        print(f"  {key:26s} {n:6d}  " + (f"{b:+8.3f}  {t:+7.2f}" if b is not None and t is not None else "   not enough data yet"))
+    print("\nReading it: a slope is points of extra margin (or total) per unit of the feature. Treat |t| < 2 as noise, and wait for a few hundred games.")
+
+
 def main():
-    print(f"═══ CFB Edge Data Pull — Season {SEASON} ═══")
+    print(f"═══ CFB Edge Data Pull {PULL_VERSION} — Season {SEASON} ═══")
     _print_key_report()
     if not CFBD_API_KEY:
         print("NOTE: running without CFBD_API_KEY — team stats will be empty and the")
@@ -2847,6 +3142,22 @@ def main():
             pos_lookup.setdefault((pl["team"], nm), pl["pos"])
     def_vs_pos = pull_def_vs_position(_completed_weeks, pos_lookup)
 
+    # ── v2.8 Stage 1: kickoff weather for every completed game (feeds the model's own weather backtest)
+    prev_wx = []
+    try:
+        with open(OUTPUT_PATH, encoding="utf-8") as _f:
+            prev_wx = json.load(_f).get("weatherGames") or []
+    except Exception:
+        prev_wx = []
+    try:
+        weather_games = pull_weather_history([SEASON - 2, SEASON - 1, SEASON], home_venues, venues_by_name, prev_wx)
+    except Exception as e:
+        print(f"  ! weather history failed ({e}); keeping the previous rows")
+        weather_games = prev_wx
+    # ── v2.8 Stage 2: daily snapshot (injuries, lines + openers, team ratings, public splits)
+    public_splits = load_public_splits()
+    snapshot_meta = write_snapshot(injuries, current_lines, teams_advanced, public_splits)
+
     # Merge odds lines onto games where we have a matchup match
     for g in games:
         key_variants = [f"{g['awayTeam']}_{g['homeTeam']}"]
@@ -2906,6 +3217,9 @@ def main():
         "pace": pace,
         "atsRecords": ats_records,
         "defVsPosition": def_vs_pos,
+        "weatherGames": weather_games,
+        "snapshotMeta": snapshot_meta,
+        "pullVersion": PULL_VERSION,
         # Explicit success/failure per data source, rather than making the
         # HTML guess from array lengths (which can legitimately be empty
         # early in a week even when the source itself worked fine).
@@ -2939,4 +3253,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--snapshot-report" in sys.argv:
+        snapshot_report()
+    else:
+        main()
