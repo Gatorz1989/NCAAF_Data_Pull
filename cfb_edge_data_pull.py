@@ -42,6 +42,9 @@ Pulls:
 v2.8 additions:
   9. Kickoff weather for every completed game (2024-2026)  -> Open-Meteo archive (free, no key). Output: weatherGames.
      The model reads it, measures what wind / cold / rain / altitude do beyond the closing line, and applies only what holds up.
+     v2.9: history lives in weather_history.json (kickoff weather + final score + closing line for each finished game, 2022-2026 by default;
+     CFB_WEATHER_YEARS_BACK changes the span). One-time fill with no time cap:  python cfb_edge_data_pull.py --weather-backfill
+     Daily runs add only games finished since the last run.
  10. Daily snapshots -> snapshots/cfb_snapshot_YYYY-MM-DD.json + snapshots/index.json: injuries, every book's lines with
      openers, team efficiency ratings as of that day, public betting splits (optional: public_splits.json or CFB_SPLITS_URL).
      Run daily and commit the snapshots folder. After a few weeks:  python cfb_edge_data_pull.py --snapshot-report
@@ -159,7 +162,7 @@ def _print_key_report():
         print("  ! CFBD and ODDS keys are identical — one of them is wrong.")
     if BIGBALLS_API_KEY and (BIGBALLS_API_KEY in (CFBD_API_KEY, ODDS_API_KEY)):
         print("  ! BIGBALLS key equals another key — one of them is wrong.")
-PULL_VERSION  = "v2.8.1"
+PULL_VERSION  = "v2.9"
 SEASON        = int(os.environ.get("CFB_SEASON", "2026"))
 OUTPUT_PATH   = os.environ.get("CFB_OUTPUT_PATH", "cfb_model_data.json")
 
@@ -2754,7 +2757,51 @@ def pull_def_vs_position(weeks, pos_lookup):
 # v2.8 STAGE 1 — historical weather for every game (Open-Meteo archive, free, no key)
 # ══════════════════════════════════════════════════════════════════════
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
-WX_HOURLY = "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_gusts_10m"
+WX_HOURLY = "temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m"
+WEATHER_FILE = os.environ.get("CFB_WEATHER_FILE", "weather_history.json")      # the stand-alone historical weather file (commit it with the data)
+WX_YEARS_BACK = int(os.environ.get("CFB_WEATHER_YEARS_BACK", "4"))             # 4 = this season plus the 4 before it (2022-2026)
+
+
+def weather_years():
+    return list(range(SEASON - WX_YEARS_BACK, SEASON + 1))
+
+
+def load_weather_history(fallback_path=None):
+    """Rows saved by earlier runs: weather_history.json first, else the weatherGames block of the last cfb_model_data.json (migration)."""
+    for path, key in ((WEATHER_FILE, "rows"), (fallback_path or OUTPUT_PATH, "weatherGames")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                j = json.load(f)
+            rows = j.get(key) if isinstance(j, dict) else None
+            if rows:
+                return rows
+        except Exception:
+            continue
+    return []
+
+
+def save_weather_history(rows, keep_other_years=None):
+    """Write weather_history.json (every row, full detail). Rows for seasons outside the current window are kept as they were."""
+    try:
+        allrows = list(rows)
+        have = {str(r.get("id")) for r in allrows}
+        for r in keep_other_years or []:
+            if str(r.get("id")) not in have:
+                allrows.append(r)
+        allrows.sort(key=lambda r: (r.get("season") or 0, r.get("wk") or 0, str(r.get("id"))))
+        with open(WEATHER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "updated": datetime.now(timezone.utc).isoformat(), "seasons": sorted({r.get("season") for r in allrows if r.get("season")}),
+                       "rows": allrows}, f, separators=(",", ":"))
+        return len(allrows)
+    except Exception as e:
+        print(f"  ! could not write {WEATHER_FILE}: {e}")
+        return 0
+
+
+def weather_for_model(rows):
+    """Compact copy for cfb_model_data.json (the model only needs these fields): ~half the size of the full rows."""
+    keep = ("season", "wk", "id", "home", "away", "venue", "dome", "elevation", "tempF", "windMph", "precipIn", "homeScore", "awayScore", "spread", "total", "src")
+    return [{k: r.get(k) for k in keep} for r in rows]
 
 
 def _wx_get(params, _tries=3):
@@ -2800,13 +2847,14 @@ WX_BUDGET_SEC = float(os.environ.get("CFB_WEATHER_BUDGET_SEC", "600"))   # per r
 WX_FAIL_BREAKER = 5                                                       # stop after this many failed calls in a row
 
 
-def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None):
+def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None, line_rows=None, checkpoint=None):
     """Weather at kickoff for every completed regular-season game in `years` (Open-Meteo archive). Powers the model's own
     weather backtest: it measures whether wind, cold, rain and altitude explain results beyond the closing line, and only
     switches an adjustment on when the data says it matters. One call per venue per season. Rows already pulled in an earlier
     run (found in the previous cfb_model_data.json) are reused, so only new games cost calls. Domes are recorded with no weather."""
     print(f"Pulling kickoff weather for completed games in {years} (Open-Meteo archive)...")
     # Reuse only rows that are final: a filled row, a dome, or a confirmed "no-data" row. A row from a failed call is never saved, so it is retried.
+    lines_by_id = {str(r.get("id")): r for r in (line_rows or []) if r.get("id") is not None}
     have = {str(r.get("id")): r for r in (previous_rows or []) if r.get("id") is not None and r.get("src") in ("open-meteo-archive", "dome", "no-data")}
     rows, todo = [], {}
     n_reused = n_skip = 0
@@ -2819,7 +2867,13 @@ def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None)
             if hp is None or ap is None or gid is None or not kick or not home or not away:
                 continue
             if str(gid) in have:
-                rows.append(have[str(gid)]); n_reused += 1
+                old = have[str(gid)]
+                ln = lines_by_id.get(str(gid))
+                if old.get("homeScore") is None:
+                    old["homeScore"], old["awayScore"] = hp, ap
+                if ln and old.get("spread") is None:
+                    old["spread"], old["total"] = ln.get("spread"), ln.get("total")
+                rows.append(old); n_reused += 1
                 continue
             nm = str(g.get("venue") or "").strip().lower()
             neutral = bool(_g(g, "neutralSite", "neutral_site"))
@@ -2830,7 +2884,11 @@ def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None)
                 n_skip += 1
                 continue
             base = {"season": y, "wk": g.get("week"), "id": str(gid), "home": home, "away": away, "venue": v.get("venue"),
-                    "kick": kick, "dome": bool(v.get("dome")), "elevation": v.get("elevation"), "lat": v.get("lat"), "lon": v.get("lon")}
+                    "kick": kick, "dome": bool(v.get("dome")), "elevation": v.get("elevation"), "lat": v.get("lat"), "lon": v.get("lon"),
+                    "homeScore": hp, "awayScore": ap}
+            ln = lines_by_id.get(str(gid))
+            if ln:
+                base["spread"], base["total"] = ln.get("spread"), ln.get("total")      # closing line, HOME spread (negative = home favored)
             if _g(g, "startTimeTBD", "start_time_tbd"):
                 base["kickGuess"] = True
                 kick = kick[:10] + "T20:00:00Z"
@@ -2859,6 +2917,11 @@ def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None)
         calls += 1
         if calls % 25 == 0:
             print(f"     weather: {calls}/{len(keys)} venue-seasons, {int(time.time() - t0)}s elapsed", flush=True)
+            if checkpoint:
+                try:
+                    checkpoint(rows)                    # progress is saved as it goes, so an interrupted run loses nothing
+                except Exception:
+                    pass
         time.sleep(0.15)
         if not j or not (j.get("hourly") or {}).get("time"):
             failed += 1; streak += 1; deferred += len(items)
@@ -3056,6 +3119,30 @@ def snapshot_report():
     print("\nReading it: a slope is points of extra margin (or total) per unit of the feature. Treat |t| < 2 as noise, and wait for a few hundred games.")
 
 
+def weather_backfill():
+    """python cfb_edge_data_pull.py --weather-backfill
+    One-time (or occasional) historical weather fill with NO time cap, for the last WX_YEARS_BACK seasons. Runs only what it needs (CFBD venues, games, lines;
+    Open-Meteo) and writes weather_history.json. Saves progress every 25 venue-seasons, and picks up where it stopped if you run it again."""
+    global WX_BUDGET_SEC
+    WX_BUDGET_SEC = 10 ** 9
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    years = weather_years()
+    print(f"═══ Weather backfill {PULL_VERSION} — seasons {years[0]}-{years[-1]} (no time cap; safe to stop and rerun) ═══")
+    if not CFBD_API_KEY:
+        print("CFBD_API_KEY is needed (keys.txt next to this script works). Stopping.")
+        return
+    team_meta, home_venues, venues_by_name = pull_team_meta_and_venues()
+    lines = pull_line_history(years)
+    prev = load_weather_history()
+    rows = pull_weather_history(years, home_venues, venues_by_name, prev, lines,
+                                checkpoint=lambda r: save_weather_history(r, [x for x in prev if x.get("season") not in years]))
+    n = save_weather_history(rows, [x for x in prev if x.get("season") not in years])
+    print(f"✅ Wrote {WEATHER_FILE} with {n} games. Upload it to the repo root next to cfb_model_data.json; the daily pull then only adds newly finished games.")
+
+
 def main():
     try:
         sys.stdout.reconfigure(line_buffering=True)   # live progress in GitHub Actions logs
@@ -3169,18 +3256,19 @@ def main():
             pos_lookup.setdefault((pl["team"], nm), pl["pos"])
     def_vs_pos = pull_def_vs_position(_completed_weeks, pos_lookup)
 
-    # ── v2.8 Stage 1: kickoff weather for every completed game (feeds the model's own weather backtest)
-    prev_wx = []
+    # ── Weather history: weather_history.json holds every finished game's kickoff weather and result; the daily run only adds new games
+    wx_years = weather_years()
+    prev_wx = load_weather_history()
     try:
-        with open(OUTPUT_PATH, encoding="utf-8") as _f:
-            prev_wx = json.load(_f).get("weatherGames") or []
-    except Exception:
-        prev_wx = []
-    try:
-        weather_games = pull_weather_history([SEASON - 2, SEASON - 1, SEASON], home_venues, venues_by_name, prev_wx)
+        wx_lines = line_history if all(y in (SEASON - 2, SEASON - 1, SEASON) for y in wx_years) else pull_line_history(wx_years)
+        weather_rows = pull_weather_history(wx_years, home_venues, venues_by_name, prev_wx, wx_lines,
+                                            checkpoint=lambda r: save_weather_history(r, [x for x in prev_wx if x.get("season") not in wx_years]))
+        n_wx = save_weather_history(weather_rows, [x for x in prev_wx if x.get("season") not in wx_years])
+        print(f"  -> {WEATHER_FILE}: {n_wx} games saved")
     except Exception as e:
         print(f"  ! weather history failed ({e}); keeping the previous rows")
-        weather_games = prev_wx
+        weather_rows = prev_wx
+    weather_games = weather_for_model(weather_rows)
     # ── v2.8 Stage 2: daily snapshot (injuries, lines + openers, team ratings, public splits)
     public_splits = load_public_splits()
     snapshot_meta = write_snapshot(injuries, current_lines, teams_advanced, public_splits)
@@ -3282,5 +3370,7 @@ def main():
 if __name__ == "__main__":
     if "--snapshot-report" in sys.argv:
         snapshot_report()
+    elif "--weather-backfill" in sys.argv:
+        weather_backfill()
     else:
         main()
