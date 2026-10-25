@@ -159,7 +159,7 @@ def _print_key_report():
         print("  ! CFBD and ODDS keys are identical — one of them is wrong.")
     if BIGBALLS_API_KEY and (BIGBALLS_API_KEY in (CFBD_API_KEY, ODDS_API_KEY)):
         print("  ! BIGBALLS key equals another key — one of them is wrong.")
-PULL_VERSION  = "v2.8"
+PULL_VERSION  = "v2.8.1"
 SEASON        = int(os.environ.get("CFB_SEASON", "2026"))
 OUTPUT_PATH   = os.environ.get("CFB_OUTPUT_PATH", "cfb_model_data.json")
 
@@ -2056,6 +2056,10 @@ def pull_team_meta_and_venues():
         name = v.get("name")
         loc = v.get("location") or {}
         lat, lon = _num(_g(loc, "y", "latitude")), _num(_g(loc, "x", "longitude"))
+        if lat is None:
+            lat = _num(v.get("latitude"))          # CFBD /venues returns latitude/longitude at the top level
+        if lon is None:
+            lon = _num(v.get("longitude"))
         if name and lat is not None and lon is not None:
             by_name[name.strip().lower()] = {"venue": name, "lat": lat, "lon": lon, "dome": bool(v.get("dome")),
                                              "grass": v.get("grass"), "elevation": _num(v.get("elevation")),
@@ -2792,13 +2796,18 @@ def _wx_window(hourly, kick_iso, hours=4):
             "precipIn": round(sum(p), 2) if p else 0.0, "humidity": round(sum(h) / len(h)) if h else None}
 
 
+WX_BUDGET_SEC = float(os.environ.get("CFB_WEATHER_BUDGET_SEC", "600"))   # per run; leftovers are picked up next run
+WX_FAIL_BREAKER = 5                                                       # stop after this many failed calls in a row
+
+
 def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None):
     """Weather at kickoff for every completed regular-season game in `years` (Open-Meteo archive). Powers the model's own
     weather backtest: it measures whether wind, cold, rain and altitude explain results beyond the closing line, and only
     switches an adjustment on when the data says it matters. One call per venue per season. Rows already pulled in an earlier
     run (found in the previous cfb_model_data.json) are reused, so only new games cost calls. Domes are recorded with no weather."""
     print(f"Pulling kickoff weather for completed games in {years} (Open-Meteo archive)...")
-    have = {str(r.get("id")): r for r in (previous_rows or []) if r.get("id") is not None}
+    # Reuse only rows that are final: a filled row, a dome, or a confirmed "no-data" row. A row from a failed call is never saved, so it is retried.
+    have = {str(r.get("id")): r for r in (previous_rows or []) if r.get("id") is not None and r.get("src") in ("open-meteo-archive", "dome", "no-data")}
     rows, todo = [], {}
     n_reused = n_skip = 0
     for y in years:
@@ -2830,8 +2839,16 @@ def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None)
                 rows.append(base)
                 continue
             todo.setdefault((y, round(v["lat"], 2), round(v["lon"], 2)), []).append((base, kick))
-    calls = filled = 0
-    for (y, lat, lon), items in todo.items():
+    calls = filled = failed = streak = deferred = 0
+    t0 = time.time()
+    keys = list(todo.keys())
+    for n_i, (y, lat, lon) in enumerate(keys):
+        items = todo[(y, lat, lon)]
+        if time.time() - t0 > WX_BUDGET_SEC or streak >= WX_FAIL_BREAKER:
+            deferred += sum(len(todo[k]) for k in keys[n_i:])
+            why = "time budget reached" if streak < WX_FAIL_BREAKER else f"{streak} failed calls in a row"
+            print(f"  ! weather step stopping early ({why}); {deferred} games left for the next run")
+            break
         days = []
         for b, k in items:
             d = datetime.fromisoformat(k.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -2840,15 +2857,21 @@ def pull_weather_history(years, home_venues, venues_by_name, previous_rows=None)
                      "hourly": WX_HOURLY, "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "precipitation_unit": "inch",
                      "timezone": "UTC"})
         calls += 1
+        if calls % 25 == 0:
+            print(f"     weather: {calls}/{len(keys)} venue-seasons, {int(time.time() - t0)}s elapsed", flush=True)
         time.sleep(0.15)
+        if not j or not (j.get("hourly") or {}).get("time"):
+            failed += 1; streak += 1; deferred += len(items)
+            continue                                   # not saved, so the next run retries it
+        streak = 0
         for b, k in items:
-            w = _wx_window((j or {}).get("hourly") or {}, k)
+            w = _wx_window(j.get("hourly") or {}, k)
             if w:
                 b.update(w); b["src"] = "open-meteo-archive"; filled += 1
             else:
-                b.update({"tempF": None, "windMph": None, "gustMph": None, "precipIn": None, "humidity": None, "src": "missing"})
+                b.update({"tempF": None, "windMph": None, "gustMph": None, "precipIn": None, "humidity": None, "src": "no-data"})
             rows.append(b)
-    print(f"  -> {len(rows)} games ({n_reused} reused from the last file, {filled} newly filled in {calls} calls, {n_skip} skipped: no venue coordinates)")
+    print(f"  -> {len(rows)} games ({n_reused} reused from the last file, {filled} newly filled in {calls} calls, {failed} failed calls, {deferred} games deferred to the next run, {n_skip} skipped: no venue coordinates)")
     return rows
 
 
@@ -3034,6 +3057,10 @@ def snapshot_report():
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # live progress in GitHub Actions logs
+    except Exception:
+        pass
     print(f"═══ CFB Edge Data Pull {PULL_VERSION} — Season {SEASON} ═══")
     _print_key_report()
     if not CFBD_API_KEY:
